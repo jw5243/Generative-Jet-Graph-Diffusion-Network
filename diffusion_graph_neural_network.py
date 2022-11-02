@@ -221,7 +221,7 @@ def create_graph(node_count, feature_dim):
     edges = tf.constant(adjacency_matrix)
     edge_weights = tf.ones(shape=edges.shape[1])
     node_features = tf.constant(np.random.exponential(1.0,
-                    size = (node_count, feature_dim)) * np.random.choice([-1, 1], size = (node_count, feature_dim)))
+                    size = (node_count, feature_dim)) * np.random.choice([-1, 1], size = (node_count, feature_dim)) + 2.)
     #node_features = tf.random.uniform(shape=[node_count, feature_dim])
 
     return [node_features, edges, edge_weights]

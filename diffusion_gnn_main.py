@@ -151,7 +151,7 @@ class BetaScheduler(object):
         self.total_time_steps = total_time_steps
 
     def get_beta(self, time_step):
-        return (self.max_beta - self.min_beta) * (float(time_step) / self.total_time_steps) + self.min_beta
+        return (self.max_beta - self.min_beta) * (float(time_step - 1) / self.total_time_steps) + self.min_beta
 
     def get_alpha(self, time_step):
         return 1. - self.get_beta(time_step)
@@ -173,15 +173,16 @@ class DiffusiveGenerativeNetwork(keras.Model):
         self.message_dim = message_dim
         self.total_time_steps = total_time_steps
         self.denoiser_model = GNN(num_particles, message_dim, 2)
+        self.diffused_inputs = []
 
     def get_model_mean_variance(self, input, time_step):
         model_output = self.denoiser_model([input, time_step])
         mean = tf.gather(model_output.features, indices = [0], axis = 1)
-        variance = tf.gather(model_output.features, indices = [1], axis = 1)
+        variance = tf.math.abs(tf.gather(model_output.features, indices = [1], axis = 1)) # TODO: Adjust model for abs
         return mean, variance
 
     def reverse_diffuse(self, input, time_step):
-        mean, variance = self.get_mean_variance(input, time_step)
+        mean, variance = self.get_model_mean_variance(input, time_step)
         noise = tf.random.normal(mean.shape, mean = mean, stddev = tf.sqrt(variance))
         output = Graph(input.features + noise, input.edges, input.edge_attributes)
         return output
@@ -194,8 +195,8 @@ class DiffusiveGenerativeNetwork(keras.Model):
         alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
         prev_alpha_bar = self.beta_scheduler.get_alpha_bar(time_step - 1)
 
-        true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample \
-                    + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * input
+        true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample.features \
+                    + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * input.features
         true_variance = ((1. - prev_alpha_bar) / (1. - alpha_bar)) * beta * tf.ones(input.features.shape)
 
         model_mean, model_variance = self.get_model_mean_variance(input, time_step)
@@ -206,11 +207,23 @@ class DiffusiveGenerativeNetwork(keras.Model):
             return 0.
 
     def call(self, input, **kwargs):
-        diffused_input = input
+        self.diffused_inputs = []
+        self.diffused_inputs.append(input)
         for t in range(self.total_time_steps, 0, -1):
-            diffused_input = self.reverse_diffuse(diffused_input, t)
+            self.diffused_inputs.insert(0, self.reverse_diffuse(self.diffused_inputs[0], t))
 
-        return diffused_input
+        return self.diffused_inputs[0]
+
+    def compute_loss(self, x = None, y = None, y_pred = None, sample_weight = None):
+        loss = None
+        for t in range(self.total_time_steps, 0, -1):
+            input = self.diffused_inputs[t - 1]
+            if loss is None:
+                loss = self.get_loss(input, y, t)
+            else:
+                loss += self.get_loss(input, y, t)
+
+        return loss
 
 
 if __name__ == '__main__':
@@ -222,7 +235,12 @@ if __name__ == '__main__':
     graph = Graph.generate_fully_connected_graph(features, num_nodes, batch_size)
 
     gnn = GNN(input_feature_dim = num_features, message_dim = 32, output_feature_dim = num_features)
-    output_graph = gnn([graph, 1])
-    print(graph.features - output_graph.features)
-    gnn.summary()
+    #output_graph = gnn([graph, 1])
+    #print(graph.features - output_graph.features)
+    #gnn.summary()
+
+    model = DiffusiveGenerativeNetwork(num_nodes, BetaScheduler(0.001, 0.3, 10), num_features)
+    model_output = model(graph)
+    #print(model.compute_loss(graph, graph, model_output))
+    print(model_output.features)
 

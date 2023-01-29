@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 from tensorflow import keras
+import matplotlib.pyplot as plt
 from copy import deepcopy
 
 
@@ -48,7 +49,8 @@ class Graph(object):
             for i in range(batch_size):
                 rows.append(edges[0] + num_nodes * i)  # Offset rows for each graph in the batch
                 cols.append(edges[1] + num_nodes * i)
-            edges = tf.concat([tf.stack(rows), tf.stack(cols)], 1)
+
+            edges = tf.stack([tf.concat(rows, 0), tf.concat(cols, 0)])
         return Graph(features, edges, edge_attr)
 
     # TODO: Finish
@@ -172,26 +174,26 @@ class DiffusiveGenerativeNetwork(keras.Model):
         self.feature_dim = feature_dim
         self.message_dim = message_dim
         self.total_time_steps = total_time_steps
-        self.denoiser_model = GNN(num_particles, message_dim, 2)
+        self.denoiser_model = GNN(num_particles, message_dim, 2 * self.feature_dim)
         self.diffused_inputs = []
 
     def get_model_mean_variance(self, input, time_step):
         model_output = self.denoiser_model([input, time_step])
-        mean = tf.gather(model_output.features, indices = [0], axis = 1)
-        variance = tf.math.abs(tf.gather(model_output.features, indices = [1], axis = 1)) # TODO: Adjust model for abs
+        mean_indices = np.arange(self.feature_dim)
+        mean = tf.gather(model_output.features, indices = mean_indices, axis = 1)
+        variance = tf.math.exp(tf.gather(model_output.features, indices = mean_indices + self.feature_dim, axis = 1))
         return mean, variance
+        #return tf.zeros(mean.shape), tf.ones(variance.shape)
 
     def reverse_diffuse(self, input, time_step):
         mean, variance = self.get_model_mean_variance(input, time_step)
         noise = tf.random.normal(mean.shape, mean = mean, stddev = tf.sqrt(variance))
-        output = Graph(input.features + noise, input.edges, input.edge_attributes)
+        output = Graph(noise, input.edges, input.edge_attributes)
         return output
 
     def get_loss(self, input, sample, time_step):
         beta = self.beta_scheduler.get_beta(time_step)
-        prev_beta = self.beta_scheduler.get_beta(time_step - 1)
         alpha = self.beta_scheduler.get_alpha(time_step)
-        prev_alpha = self.beta_scheduler.get_alpha(time_step - 1)
         alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
         prev_alpha_bar = self.beta_scheduler.get_alpha_bar(time_step - 1)
 
@@ -204,7 +206,7 @@ class DiffusiveGenerativeNetwork(keras.Model):
         if time_step > 1:
             return kl_divergence
         else:
-            return 0.
+            return 0. # TODO: Replace with loss function comparing sample and input at t = 0
 
     def call(self, input, **kwargs):
         self.diffused_inputs = []
@@ -227,20 +229,34 @@ class DiffusiveGenerativeNetwork(keras.Model):
 
 
 if __name__ == '__main__':
-    batch_size = 2
+    batch_size = 1000#2
     num_nodes = 4
     num_features = 3
 
-    features = tf.random.uniform([batch_size * num_nodes, num_features])
+    features = tf.random.normal([batch_size * num_nodes, num_features]) + 3.
     graph = Graph.generate_fully_connected_graph(features, num_nodes, batch_size)
+
+    feature1 = list(map(lambda feature: feature[0], graph.features))
+
+    beta_scheduler = BetaScheduler(0.01, 0.3, 100)
+    #for i in range(100):
+    #    graph.diffuse(0.05)
+
+    #diffused_feature1 = list(map(lambda feature: feature[0], graph.features))
 
     gnn = GNN(input_feature_dim = num_features, message_dim = 32, output_feature_dim = num_features)
     #output_graph = gnn([graph, 1])
     #print(graph.features - output_graph.features)
     #gnn.summary()
 
-    model = DiffusiveGenerativeNetwork(num_nodes, BetaScheduler(0.001, 0.3, 10), num_features)
+    model = DiffusiveGenerativeNetwork(num_nodes, BetaScheduler(0.01, 0.3, 100), num_features, 100)
     model_output = model(graph)
     #print(model.compute_loss(graph, graph, model_output))
-    print(model_output.features)
+    #print(model_output.features)
+
+    model_feature1 = list(map(lambda feature: feature[0], model_output.features))
+
+    plt.hist(feature1, 100, range = (-5, 8), alpha = 0.5)
+    plt.hist(model_feature1, 100, range = (-5, 8), alpha = 0.5)
+    plt.show()
 

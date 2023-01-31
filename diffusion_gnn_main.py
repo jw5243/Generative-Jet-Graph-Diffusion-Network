@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 
 
+def normal_distribution(x, mu, variance):
+    return (1. / tf.math.sqrt(2. * np.pi * variance)) * tf.math.exp(-tf.pow(x - mu, 2) / (2. * variance))
+
+
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
     KL divergence between normal distributions parameterized by mean and log-variance.
@@ -183,7 +187,6 @@ class DiffusiveGenerativeNetwork(keras.Model):
         mean = tf.gather(model_output.features, indices = mean_indices, axis = 1)
         variance = tf.math.exp(tf.gather(model_output.features, indices = mean_indices + self.feature_dim, axis = 1))
         return mean, variance
-        #return tf.zeros(mean.shape), tf.ones(variance.shape)
 
     def reverse_diffuse(self, input, time_step):
         mean, variance = self.get_model_mean_variance(input, time_step)
@@ -206,7 +209,7 @@ class DiffusiveGenerativeNetwork(keras.Model):
         if time_step > 1:
             return kl_divergence
         else:
-            return 0. # TODO: Replace with loss function comparing sample and input at t = 0
+            return 0.
 
     def call(self, input, **kwargs):
         self.diffused_inputs = []

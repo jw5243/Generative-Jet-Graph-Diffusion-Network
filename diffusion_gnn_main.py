@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 from copy import deepcopy
 
 
+def normal_distribution(x, mu, variance):
+    return (1. / tf.math.sqrt(2. * np.pi * variance)) * tf.math.exp(-tf.math.squared_difference(x, mu) / (2. * variance))
+
+
 def normal_kl(mean1, logvar1, mean2, logvar2):
     """
     KL divergence between normal distributions parameterized by mean and log-variance.
@@ -174,16 +178,17 @@ class DiffusiveGenerativeNetwork(keras.Model):
         self.feature_dim = feature_dim
         self.message_dim = message_dim
         self.total_time_steps = total_time_steps
-        self.denoiser_model = GNN(num_particles, message_dim, 2 * self.feature_dim)
+        self.denoiser_model = GNN(num_particles, message_dim, self.feature_dim + 1)  # mean (n) + variance (1)
         self.diffused_inputs = []
 
+    """
+    Outputs a mean and variance of a normal distribution using the denoising model
+    """
     def get_model_mean_variance(self, input, time_step):
-        model_output = self.denoiser_model([input, time_step])
-        mean_indices = np.arange(self.feature_dim)
-        mean = tf.gather(model_output.features, indices = mean_indices, axis = 1)
-        variance = tf.math.exp(tf.gather(model_output.features, indices = mean_indices + self.feature_dim, axis = 1))
+        model_output = self.denoiser_model([input, time_step])  # Get output of denoiser model
+        mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+        variance = tf.math.exp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1))
         return mean, variance
-        #return tf.zeros(mean.shape), tf.ones(variance.shape)
 
     def reverse_diffuse(self, input, time_step):
         mean, variance = self.get_model_mean_variance(input, time_step)
@@ -192,21 +197,35 @@ class DiffusiveGenerativeNetwork(keras.Model):
         return output
 
     def get_loss(self, input, sample, time_step):
-        beta = self.beta_scheduler.get_beta(time_step)
-        alpha = self.beta_scheduler.get_alpha(time_step)
-        alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
-        prev_alpha_bar = self.beta_scheduler.get_alpha_bar(time_step - 1)
-
-        true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample.features \
-                    + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * input.features
-        true_variance = ((1. - prev_alpha_bar) / (1. - alpha_bar)) * beta * tf.ones(input.features.shape)
-
         model_mean, model_variance = self.get_model_mean_variance(input, time_step)
-        kl_divergence = normal_kl(true_mean, tf.math.log(true_variance), model_mean, tf.math.log(model_variance))
         if time_step > 1:
-            return kl_divergence
+            beta = self.beta_scheduler.get_beta(time_step)
+            alpha = self.beta_scheduler.get_alpha(time_step)
+            alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
+            prev_alpha_bar = self.beta_scheduler.get_alpha_bar(time_step - 1)
+
+            true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample.features \
+                        + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * input.features
+            true_variance = ((1. - prev_alpha_bar) / (1. - alpha_bar)) * beta * tf.ones(input.features.shape)
+
+            kl_divergence = normal_kl(true_mean, tf.math.log(true_variance), model_mean, tf.math.log(model_variance))
+
+            batch_size = int(kl_divergence.shape[0] / self.num_particles)
+            errors = []
+            for i in range(batch_size):
+                errors.append(tf.math.reduce_mean(kl_divergence[4 * i:4 * (i + 1)]) / np.log(2.))
+            errors = tf.stack(errors)
+            return errors
         else:
-            return 0. # TODO: Replace with loss function comparing sample and input at t = 0
+            errors = []
+            normal_sample = 1.
+            for i in range(model_mean.shape[1]):
+                normal_sample *= normal_distribution(sample.features[:, i], model_mean[:, i], model_variance[:, 0])
+            batch_size = int(len(normal_sample) / self.num_particles)
+            for j in range(batch_size):
+                errors.append(tf.math.reduce_mean(normal_sample[4 * j:4 * (j + 1)]))
+            errors = tf.stack(errors)
+            return errors
 
     def call(self, input, **kwargs):
         self.diffused_inputs = []
@@ -221,9 +240,9 @@ class DiffusiveGenerativeNetwork(keras.Model):
         for t in range(self.total_time_steps, 0, -1):
             input = self.diffused_inputs[t - 1]
             if loss is None:
-                loss = self.get_loss(input, y, t)
+                loss = self.get_loss(input, y, t - 1)
             else:
-                loss += self.get_loss(input, y, t)
+                loss += self.get_loss(input, y, t - 1)
 
         return loss
 
@@ -251,7 +270,7 @@ if __name__ == '__main__':
 
     model = DiffusiveGenerativeNetwork(num_nodes, BetaScheduler(0.01, 0.3, 100), num_features, 100)
     model_output = model(graph)
-    #print(model.compute_loss(graph, graph, model_output))
+    print(model.compute_loss(graph, graph, model_output))
     #print(model_output.features)
 
     model_feature1 = list(map(lambda feature: feature[0], model_output.features))

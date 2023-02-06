@@ -1,12 +1,10 @@
 import tensorflow as tf
 import numpy as np
 from tensorflow import keras
-import matplotlib.pyplot as plt
-from copy import deepcopy
 import diffusion_gnn_main
 
-batch_count = 5
-batch_size = 1000
+batch_count = 100
+batch_size = 10
 num_nodes = 4
 num_features = 3
 
@@ -33,7 +31,7 @@ x_train = generate_input_data(batch_count, batch_size, num_nodes, num_features)
 y_train = generate_training_data(batch_count, batch_size, num_nodes, num_features)
 
 # Reserve 1000 samples for validation.
-validation_count = 100
+validation_count = 1
 
 x_val = x_train[-validation_count:]
 y_val = y_train[-validation_count:]
@@ -50,8 +48,9 @@ val_dataset = val_dataset.batch(batch_size)
 
 epochs = 10
 for epoch in range(epochs):
-    print("\nStart of epoch %d" % (epoch,))
     # Iterate over the batches of the dataset.
+    progress_bar = tf.keras.utils.Progbar(len(train_dataset), stateful_metrics = ['epoch', 'loss'])
+    losses = []
     for step, (x_batch_train, y_batch_train) in enumerate(train_dataset):
         batch_size_train = x_batch_train.shape[0]
         x_batch_train = tf.reshape(x_batch_train, [x_batch_train.shape[0] * x_batch_train.shape[1], x_batch_train.shape[2]])
@@ -69,7 +68,6 @@ for epoch in range(epochs):
             logits = diffusion_model(x_batch_train, training = True)  # Logits for this minibatch
 
             # Compute the loss value for this minibatch.
-            #loss_value = loss_fn(y_batch_train, logits)
             loss_value = diffusion_model.compute_loss(y = logits)
 
         # Use the gradient tape to automatically retrieve
@@ -80,11 +78,6 @@ for epoch in range(epochs):
         # the value of the variables to minimize the loss.
         optimizer.apply_gradients(zip(grads, diffusion_model.trainable_weights))
 
-        # Log every 200 batches.
-        if step % 200 == 0:
-            print(
-                "Training loss (for one batch) at step %d: %.4f"
-                % (step, float(tf.math.reduce_mean(loss_value)))
-            )
-            print("Seen so far: %s samples" % ((step + 1) * batch_size))
+        losses.append(float(tf.math.reduce_mean(loss_value)))
+        progress_bar.update(step + 1, values = [('epoch', int(epoch)), ('loss', np.mean(losses))])
 

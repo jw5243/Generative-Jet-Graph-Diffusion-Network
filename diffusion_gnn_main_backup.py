@@ -97,7 +97,7 @@ class GCL(keras.layers.Layer):
         # MLP for computing messages m_{ij}
         if not single_node:
             self.message_mlp = keras.Sequential()
-            self.message_mlp.add(keras.Input(shape = (2 * input_feature_dim + 1,))) # +1 for time dim
+            self.message_mlp.add(keras.Input(shape = (2 * input_feature_dim,)))
             self.message_mlp.add(keras.layers.Dense(message_dim, use_bias = True))
             self.message_mlp.add(keras.layers.Activation(activation))
             self.message_mlp.add(keras.layers.Dense(message_dim, use_bias = True))
@@ -105,7 +105,7 @@ class GCL(keras.layers.Layer):
             
             # MLP for updating node feature vectors h_i
             self.feature_mlp = keras.Sequential()
-            self.feature_mlp.add(keras.Input(shape = (input_feature_dim + message_dim + 1,))) # +1 for time dim
+            self.feature_mlp.add(keras.Input(shape = (input_feature_dim + 2 * message_dim,)))
             self.feature_mlp.add(keras.layers.Activation(activation))
             self.feature_mlp.add(keras.layers.Dense(message_dim, use_bias = True))
             self.feature_mlp.add(keras.layers.Activation(activation))
@@ -114,41 +114,38 @@ class GCL(keras.layers.Layer):
         else:
             # MLP for updating node feature vectors h_i
             self.feature_mlp = keras.Sequential()
-            self.feature_mlp.add(keras.Input(shape = (2 * input_feature_dim + 1,))) # +1 for time dim
-            #self.feature_mlp.add(keras.layers.Activation(activation))
+            self.feature_mlp.add(keras.Input(shape = (input_feature_dim + message_dim,)))
+            self.feature_mlp.add(keras.layers.Activation(activation))
             self.feature_mlp.add(keras.layers.Dense(message_dim, use_bias = True))
             self.feature_mlp.add(keras.layers.Activation(activation))
             self.feature_mlp.add(keras.layers.Dense(output_feature_dim, use_bias = True))
             self.feature_mlp.add(keras.layers.Activation(keras.activations.softsign))
 
-    def compute_messages(self, source, target, time_step):
-        time_steps = tf.fill([source.shape[0], 1], float(time_step))
-        message_input = tf.concat([source, target, time_steps], axis = 1)
+    def compute_messages(self, source, target):
+        message_input = tf.concat([source, target], axis = 1)
         out = self.message_mlp(message_input)
         return out
 
-    def update_features(self, features, edge_index, messages, time_step):
-        time_steps = tf.fill([features.shape[0], 1], float(time_step))
+    def update_features(self, features, edge_index, messages, time_embedding):
         if edge_index is None and messages is None:
-            empty_messages = tf.zeros(features.shape)
-            feature_inputs = tf.concat([features, empty_messages, time_steps], axis = 1)
+            feature_inputs = tf.concat([features, time_embedding], axis = 1)
             out = self.feature_mlp(feature_inputs)
             return out
 
         row, col = edge_index
         message_aggregate = tf.math.unsorted_segment_sum(messages, row, num_segments = features.shape[0])
-        feature_inputs = tf.concat([features, message_aggregate, time_steps], axis = 1)
+        feature_inputs = tf.concat([features, message_aggregate, time_embedding], axis = 1)
         out = self.feature_mlp(feature_inputs)
         return out
 
     def call(self, inputs, **kwargs):
-        input, time_step = inputs
+        input, time_embedding = inputs
         if len(input.edges[0]) > 0:
             rows, cols = input.edges  # rows and cols indices of adjacency matrix
-            messages = self.compute_messages(tf.gather(input.features, indices = rows), tf.gather(input.features, indices = cols), time_step)
-            updated_features = self.update_features(input.features, input.edges, messages, time_step)
+            messages = self.compute_messages(tf.gather(input.features, indices = rows), tf.gather(input.features, indices = cols))
+            updated_features = self.update_features(input.features, input.edges, messages, time_embedding)
         else:
-            updated_features = self.update_features(input.features, None, None, time_step)
+            updated_features = self.update_features(input.features, None, None, time_embedding)
         return Graph(updated_features, input.edges, input.edge_attributes)
 
 
@@ -163,13 +160,23 @@ class GNN(keras.Model):
         self.feature_in = keras.layers.Dense(message_dim, use_bias = False)
         self.feature_out = keras.layers.Dense(output_feature_dim, use_bias = False)
         self.layer_list = [GCL(self.message_dim, self.message_dim, self.message_dim, activation = activation, single_node = input_feature_dim == 1) for i in range(num_layers)]
+        
+        self.time_mlp = keras.Sequential()
+        self.time_mlp.add(keras.Input(shape = (1,)))
+        self.time_mlp.add(keras.layers.Dense(self.message_dim, use_bias = True))
+        self.time_mlp.add(keras.layers.Activation(keras.activations.swish))
+        self.time_mlp.add(keras.layers.Dense(self.message_dim, use_bias = True))
 
     def call(self, inputs, **kwargs):
         input, time_step = inputs
-        mixed_features = self.feature_in(input.features)
+        time_steps = tf.fill([input.features.shape[0], 1], float(time_step))
+        time_embedding = self.time_mlp(time_steps)
+        feature_inputs = tf.concat([input.features, time_embedding], axis = 1)
+        mixed_features = self.feature_in(feature_inputs)
+        mixed_features = self.activation(mixed_features)
         mixed_graph = Graph(mixed_features, input.edges, input.edge_attributes)
         for i in range(len(self.layer_list)):
-            mixed_graph = self.layer_list[i]([mixed_graph, time_step])
+            mixed_graph = self.layer_list[i]([mixed_graph, time_embedding])
 
         out_features = self.feature_out(mixed_graph.features)
         return Graph(out_features, input.edges, input.edge_attributes)
@@ -180,16 +187,18 @@ class BetaScheduler(object):
         self.min_beta = min_beta
         self.max_beta = max_beta
         self.total_time_steps = total_time_steps
+        self.betas = np.linspace(min_beta ** 0.5, max_beta ** 0.5, total_time_steps, dtype=np.float64) ** 2
 
     def get_beta(self, time_step):
-        return np.clip((self.max_beta - self.min_beta) * (float(time_step - 1) / self.total_time_steps) + self.min_beta, 0., 1.)
+        #return np.clip((self.max_beta - self.min_beta) * (float(time_step - 1) / self.total_time_steps) + self.min_beta, 0., 1.)
+        return self.betas[time_step]
 
     def get_alpha(self, time_step):
         return 1. - self.get_beta(time_step)
 
     def get_alpha_bar(self, time_step):
         alpha_bar = 1.
-        for i in range(1, time_step + 1):
+        for i in range(time_step):
             alpha_bar *= self.get_alpha(time_step)
 
         return alpha_bar
@@ -205,28 +214,36 @@ class DiffusiveGenerativeNetwork(keras.Model):
         self.total_time_steps = total_time_steps
         self.denoiser_model = GNN(num_particles, message_dim, self.feature_dim + 1, num_layers = num_layers)  # mean (n) + variance (1)
         self.diffused_inputs = []
+        self.current_mean = None
+        self.current_variance = None
+        
+    def reset_mean_variance(self):
+        self.current_mean = None
+        self.current_variance = None
 
     """
     Outputs a mean and variance of a normal distribution using the denoising model
     """
     def get_model_mean_variance(self, input, time_step):
-        model_output = self.denoiser_model([input, time_step])  # Get output of denoiser model
-        mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
-        variance = tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.))
-        #if time_step == 0:
-        #    return tf.zeros(mean.shape) + 3., tf.ones(variance.shape) * (0.3 ** 2)
-        #else:
-        #print(tf.math.reduce_mean(mean), tf.math.reduce_mean(variance))
-        return mean, variance
-        #return tf.zeros(mean.shape) + 5., tf.ones(variance.shape) * (2. ** 2)
+        model_output = self.denoiser_model([input, float(time_step) / float(self.total_time_steps)])  # Get output of denoiser model
+        if self.current_mean is None:
+            self.current_mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+            self.current_variance = tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.)) + 1.
+        self.current_mean += tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+        self.current_variance += tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.))
+        return self.current_mean, self.current_variance
+        
+    def forward_diffuse(self, input, time_step):
+        alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
+        noise = tf.random.normal(input.features.shape)
+        return Graph(np.sqrt(alpha_bar) * input.features + np.sqrt(1. - alpha_bar) * noise, input.edges, input.edge_attributes)
 
     def reverse_diffuse(self, input, time_step):
         mean, variance = self.get_model_mean_variance(input, time_step)
         noise = tf.random.normal(mean.shape, mean = mean, stddev = tf.sqrt(variance))
-        output = Graph(noise, input.edges, input.edge_attributes)
-        return output
+        return Graph(noise, input.edges, input.edge_attributes)
 
-    def get_loss(self, input, sample, time_step):
+    def get_loss(self, input, sample, sample_t, time_step):
         model_mean, model_variance = self.get_model_mean_variance(input, time_step)
         if time_step > 1:
             beta = self.beta_scheduler.get_beta(time_step)
@@ -235,8 +252,11 @@ class DiffusiveGenerativeNetwork(keras.Model):
             prev_alpha_bar = self.beta_scheduler.get_alpha_bar(time_step - 1)
 
             true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample.features \
-                        + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * input.features
+                        + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * sample_t.features#input.features
             true_variance = ((1. - prev_alpha_bar) / (1. - alpha_bar)) * beta * tf.ones(input.features.shape)
+            
+            
+            #print(float(tf.math.reduce_mean(true_mean)), float(tf.math.reduce_mean(model_mean)), float(tf.math.reduce_mean(true_variance)), float(tf.math.reduce_mean(model_variance)))
 
             kl_divergence = normal_kl(true_mean, tf.math.log(true_variance), model_mean, tf.math.log(model_variance))
 
@@ -245,6 +265,7 @@ class DiffusiveGenerativeNetwork(keras.Model):
             for i in range(batch_size):
                 errors.append(tf.math.reduce_mean(kl_divergence[self.num_particles * i:self.num_particles * (i + 1)])) #/ np.log(2.))
             errors = tf.stack(errors)
+            #print(float(tf.math.reduce_mean(errors)))
             return errors
         else:
             errors = []
@@ -255,9 +276,11 @@ class DiffusiveGenerativeNetwork(keras.Model):
             for j in range(batch_size):
                 errors.append(tf.math.reduce_mean(tf.math.log(normal_sample[self.num_particles * j:self.num_particles * (j + 1)]) * -1.)) #/ np.log(2.))
             errors = tf.stack(errors)
+            #print(float(tf.math.reduce_mean(errors)))
             return errors
 
     def call(self, input, **kwargs):
+        self.reset_mean_variance()
         self.diffused_inputs = []
         self.diffused_inputs.append(input)
         for t in range(self.total_time_steps, 0, -1):
@@ -266,13 +289,20 @@ class DiffusiveGenerativeNetwork(keras.Model):
         return self.diffused_inputs[0]
 
     def compute_loss(self, x = None, y = None, y_pred = None, sample_weight = None):
+        self.reset_mean_variance()
         loss = None
         for t in range(self.total_time_steps, 0, -1):
             input = self.diffused_inputs[t - 1]
             if loss is None:
-                loss = self.get_loss(input, y, t - 1)
+                if t == 1:
+                    loss = self.get_loss(input, y, y, t - 1)
+                else:
+                    loss = self.get_loss(input, y, self.forward_diffuse(y, t - 1), t - 1)
             else:
-                loss += self.get_loss(input, y, t - 1)
+                if t == 1:
+                    loss += self.get_loss(input, y, y, t - 1)
+                else:
+                    loss += self.get_loss(input, y, self.forward_diffuse(y, t - 1), t - 1)
 
         return loss
 

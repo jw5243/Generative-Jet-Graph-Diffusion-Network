@@ -114,12 +114,15 @@ class GCL(keras.layers.Layer):
         else:
             # MLP for updating node feature vectors h_i
             self.feature_mlp = keras.Sequential()
+            self.feature_mlp.add(keras.layers.LayerNormalization(axis = 1))
             self.feature_mlp.add(keras.Input(shape = (input_feature_dim + message_dim,)))
+            #self.feature_mlp.add(keras.layers.Activation(activation))
+            self.feature_mlp.add(keras.layers.Dense(message_dim, use_bias = False))
             self.feature_mlp.add(keras.layers.Activation(activation))
-            self.feature_mlp.add(keras.layers.Dense(message_dim, use_bias = True))
-            self.feature_mlp.add(keras.layers.Activation(activation))
-            self.feature_mlp.add(keras.layers.Dense(output_feature_dim, use_bias = True))
-            self.feature_mlp.add(keras.layers.Activation(keras.activations.softsign))
+            self.feature_mlp.add(keras.layers.LayerNormalization(axis = 1))
+            self.feature_mlp.add(keras.layers.Dropout(0.1))
+            self.feature_mlp.add(keras.layers.Dense(output_feature_dim, use_bias = False))
+            #self.feature_mlp.add(keras.layers.Activation(keras.activations.swish))
 
     def compute_messages(self, source, target):
         message_input = tf.concat([source, target], axis = 1)
@@ -158,6 +161,7 @@ class GNN(keras.Model):
         self.activation = activation
         self.num_layers = num_layers
         self.feature_in = keras.layers.Dense(message_dim, use_bias = False)
+        self.in_normalization = keras.layers.LayerNormalization(axis = 1)
         self.feature_out = keras.layers.Dense(output_feature_dim, use_bias = False)
         self.layer_list = [GCL(self.message_dim, self.message_dim, self.message_dim, activation = activation, single_node = input_feature_dim == 1) for i in range(num_layers)]
         
@@ -172,13 +176,19 @@ class GNN(keras.Model):
         time_steps = tf.fill([input.features.shape[0], 1], float(time_step))
         time_embedding = self.time_mlp(time_steps)
         feature_inputs = tf.concat([input.features, time_embedding], axis = 1)
+        feature_inputs = self.in_normalization(feature_inputs)
         mixed_features = self.feature_in(feature_inputs)
-        mixed_features = self.activation(mixed_features)
+        #mixed_features = self.activation(mixed_features)
+        #print(mixed_features)
         mixed_graph = Graph(mixed_features, input.edges, input.edge_attributes)
         for i in range(len(self.layer_list)):
             mixed_graph = self.layer_list[i]([mixed_graph, time_embedding])
-
+        
         out_features = self.feature_out(mixed_graph.features)
+        #out_features = self.activation(out_features)
+        #print(self.feature_out.get_weights())
+        #print(mixed_graph.features)
+        #print(out_features)
         return Graph(out_features, input.edges, input.edge_attributes)
 
 
@@ -212,7 +222,7 @@ class DiffusiveGenerativeNetwork(keras.Model):
         self.feature_dim = feature_dim
         self.message_dim = message_dim
         self.total_time_steps = total_time_steps
-        self.denoiser_model = GNN(num_particles, message_dim, self.feature_dim + 1, num_layers = num_layers)  # mean (n) + variance (1)
+        self.denoiser_model = GNN(num_particles, message_dim, self.feature_dim + 1, activation = keras.activations.swish, num_layers = num_layers)  # mean (n) + variance (1)
         self.diffused_inputs = []
         self.current_mean = None
         self.current_variance = None
@@ -225,13 +235,25 @@ class DiffusiveGenerativeNetwork(keras.Model):
     Outputs a mean and variance of a normal distribution using the denoising model
     """
     def get_model_mean_variance(self, input, time_step):
+        #print(input.features)
         model_output = self.denoiser_model([input, float(time_step) / float(self.total_time_steps)])  # Get output of denoiser model
-        if self.current_mean is None:
-            self.current_mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
-            self.current_variance = tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.)) + 1.
-        self.current_mean += tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
-        self.current_variance += tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.))
-        return self.current_mean, self.current_variance
+        #if self.current_mean is None:
+        #    self.current_mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+        #    self.current_variance = tf.math.exp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.) + 1.
+            #self.current_variance = tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.)) + 1.
+        #self.current_mean += tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+        #self.current_variance += tf.math.exp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.)
+        #self.current_variance += tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.))
+        mean = tf.gather(model_output.features, indices = np.arange(self.feature_dim), axis = 1)
+        #variance = tf.math.exp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1))
+        variance = tf.math.exp(soft_clamp(tf.gather(model_output.features, indices = [self.feature_dim], axis = 1), 5.))
+        #print(model_output.features)
+        #print(tf.math.reduce_std(mean), tf.math.reduce_std(variance))
+        #print(tf.math.reduce_mean(mean), tf.math.reduce_mean(variance))
+        #print(mean, variance)
+        #return self.current_mean, self.current_variance
+        return mean, variance
+        #return tf.zeros(mean.shape) + 5., tf.ones(variance.shape) * (0.5 ** 2)
         
     def forward_diffuse(self, input, time_step):
         alpha_bar = self.beta_scheduler.get_alpha_bar(time_step)
@@ -241,7 +263,11 @@ class DiffusiveGenerativeNetwork(keras.Model):
     def reverse_diffuse(self, input, time_step):
         mean, variance = self.get_model_mean_variance(input, time_step)
         noise = tf.random.normal(mean.shape, mean = mean, stddev = tf.sqrt(variance))
-        return Graph(noise, input.edges, input.edge_attributes)
+        #return Graph(noise, input.edges, input.edge_attributes)
+        if False:#time_step == 0:
+            return Graph(mean, input.edges, input.edge_attributes)
+        else:
+            return Graph(mean + tf.sqrt(variance) * noise, input.edges, input.edge_attributes)
 
     def get_loss(self, input, sample, sample_t, time_step):
         model_mean, model_variance = self.get_model_mean_variance(input, time_step)
@@ -254,7 +280,6 @@ class DiffusiveGenerativeNetwork(keras.Model):
             true_mean = (np.sqrt(prev_alpha_bar) * beta / (1. - alpha_bar)) * sample.features \
                         + (np.sqrt(alpha) * (1. - prev_alpha_bar) / (1. - alpha_bar)) * sample_t.features#input.features
             true_variance = ((1. - prev_alpha_bar) / (1. - alpha_bar)) * beta * tf.ones(input.features.shape)
-            
             
             #print(float(tf.math.reduce_mean(true_mean)), float(tf.math.reduce_mean(model_mean)), float(tf.math.reduce_mean(true_variance)), float(tf.math.reduce_mean(model_variance)))
 
@@ -274,7 +299,11 @@ class DiffusiveGenerativeNetwork(keras.Model):
                 normal_sample *= normal_distribution(sample.features[:, i], model_mean[:, i], model_variance[:, 0])
             batch_size = int(len(normal_sample) / self.num_particles)
             for j in range(batch_size):
-                errors.append(tf.math.reduce_mean(tf.math.log(normal_sample[self.num_particles * j:self.num_particles * (j + 1)]) * -1.)) #/ np.log(2.))
+                #print("--------------------------------------------------------------------------")
+                #print(normal_sample[self.num_particles * j:self.num_particles * (j + 1)])
+                #print("--------------------------------------------------------------------------2")
+                #print(tf.math.log(normal_sample[self.num_particles * j:self.num_particles * (j + 1)]) * -1.)
+                errors.append(tf.math.reduce_mean(tf.math.log(tf.maximum(normal_sample[self.num_particles * j:self.num_particles * (j + 1)], 1e-12)) * -1.)) #/ np.log(2.))
             errors = tf.stack(errors)
             #print(float(tf.math.reduce_mean(errors)))
             return errors
